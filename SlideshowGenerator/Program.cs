@@ -1,6 +1,6 @@
-using SlideshowGenerator.Forms;
+using LanguageCourseSlides.Forms;
 
-namespace SlideshowGenerator;
+namespace LanguageCourseSlides;
 
 internal static class Program
 {

@@ -1,7 +1,7 @@
 using System.IO;
 using System.Text.Json.Serialization;
 
-namespace SlideshowGenerator.Models;
+namespace LanguageCourseSlides.Models;
 
 public class WordEntry
 {

@@ -17,20 +17,20 @@ index slides, and internal hyperlinks.
 ## Building
 
 ```
-cd SlideshowGenerator
+cd LanguageCourseSlides
 dotnet restore
 dotnet build
 dotnet run
 ```
 
-Or open `SlideshowGenerator.csproj` in Visual Studio and press F5.
+Or open `LanguageCourseSlides.csproj` in Visual Studio and press F5.
 
 ---
 
 ## Project Structure
 
 ```
-SlideshowGenerator/
+LanguageCourseSlides/
 ├── Models/
 │   ├── AssetData.cs           Carries image/audio from a file path or embedded bytes
 │   ├── SlideDefinition.cs     Maps a template slide to a role (Static / Index / Word)
@@ -130,7 +130,7 @@ You can also click any Image/Audio cell in the app preview to browse for a file.
 ## Saved Configuration Location
 
 ```
-%APPDATA%\SlideshowGenerator\templates\
+%APPDATA%\LanguageCourseSlides\templates\
 ```
 
 ---

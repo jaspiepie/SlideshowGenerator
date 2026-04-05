@@ -1,19 +1,16 @@
-using SlideshowGenerator.Models;
-using SlideshowGenerator.Services;
+using LanguageCourseSlides.Models;
+using LanguageCourseSlides.Services;
 
-namespace SlideshowGenerator.Forms;
+namespace LanguageCourseSlides.Forms;
 
-/// <summary>
-/// Lists all saved TemplateConfigs and allows New / Edit / Delete.
-/// </summary>
 public class TemplateManagerForm : Form
 {
-    private ListBox   lstTemplates = null!;
-    private Button    btnNew       = null!;
-    private Button    btnEdit      = null!;
-    private Button    btnDelete    = null!;
-    private Button    btnClose     = null!;
-    private Label     lblDetails   = null!;
+    private ListBox listTemplates = null!;
+    private Label   lblDetail     = null!;
+    private Button  btnNew        = null!;
+    private Button  btnEdit       = null!;
+    private Button  btnDelete     = null!;
+    private Button  btnClose      = null!;
 
     private List<TemplateConfig> _configs = [];
 
@@ -23,126 +20,104 @@ public class TemplateManagerForm : Form
         Reload();
     }
 
-    // ── UI ───────────────────────────────────────────────────────────────
-
     private void BuildUI()
     {
         Text            = "Manage Templates";
-        Size            = new Size(520, 400);
-        MinimumSize     = new Size(420, 320);
+        Size            = new Size(560, 440);
+        MinimumSize     = new Size(460, 360);
         StartPosition   = FormStartPosition.CenterParent;
-        FormBorderStyle = FormBorderStyle.Sizable;
         Font            = new Font("Segoe UI", 9f);
 
         var split = new SplitContainer
         {
-            Dock        = DockStyle.Fill,
-            Orientation = Orientation.Horizontal,
-            SplitterDistance = 260,
-            Panel2MinSize    = 80,
+            Dock = DockStyle.Fill, Orientation = Orientation.Vertical,
+            SplitterDistance = 200,
         };
 
-        lstTemplates = new ListBox
+        listTemplates = new ListBox { Dock = DockStyle.Fill, DisplayMember = nameof(TemplateConfig.ConfigName) };
+        listTemplates.SelectedIndexChanged += (_, _) => UpdateDetail();
+        listTemplates.DoubleClick          += (_, _) => Edit();
+        split.Panel1.Controls.Add(listTemplates);
+
+        var right = new TableLayoutPanel
         {
-            Dock          = DockStyle.Fill,
-            DisplayMember = nameof(TemplateConfig.ConfigName),
-            BorderStyle   = BorderStyle.None,
-            ItemHeight    = 22,
+            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(6),
         };
-        lstTemplates.SelectedIndexChanged += LstTemplates_SelectedIndexChanged;
-        lstTemplates.DoubleClick          += (s, e) => EditSelected();
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        split.Panel1.Controls.Add(lstTemplates);
-
-        lblDetails = new Label
+        lblDetail = new Label
         {
-            Dock      = DockStyle.Fill,
-            Padding   = new Padding(10, 8, 10, 4),
-            ForeColor = Color.DimGray,
+            Dock = DockStyle.Fill, AutoSize = false, ForeColor = Color.DimGray,
+            Font = new Font("Segoe UI", 8.5f),
         };
-        split.Panel2.Controls.Add(lblDetails);
+        right.Controls.Add(lblDetail, 0, 0);
 
-        var btnPanel = new FlowLayoutPanel
+        var btns = new FlowLayoutPanel
         {
-            Dock          = DockStyle.Bottom,
-            Height        = 44,
-            FlowDirection = FlowDirection.RightToLeft,
-            Padding       = new Padding(8, 6, 8, 4),
+            Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoSize = true,
         };
+        btnNew    = Btn("New Template",    () => { using var f = new TemplateConfigForm();    if (f.ShowDialog() == DialogResult.OK) Reload(); });
+        btnEdit   = Btn("Edit Selected",   Edit);
+        btnDelete = Btn("Delete Selected", Delete);
+        btnClose  = Btn("Close",           Close);
 
-        btnClose  = new Button { Text = "Close",  Width = 80, DialogResult = DialogResult.Cancel };
-        btnDelete = new Button { Text = "Delete",  Width = 80, Enabled = false };
-        btnEdit   = new Button { Text = "Edit…",   Width = 80, Enabled = false };
-        btnNew    = new Button { Text = "New…",    Width = 80 };
-
-        btnNew.Click    += (s, e) => CreateNew();
-        btnEdit.Click   += (s, e) => EditSelected();
-        btnDelete.Click += (s, e) => DeleteSelected();
-
-        btnPanel.Controls.AddRange([btnClose, btnDelete, btnEdit, btnNew]);
-
+        btns.Controls.AddRange([btnNew, btnEdit, btnDelete, new Label { Height = 8 }, btnClose]);
+        right.Controls.Add(btns, 0, 1);
+        split.Panel2.Controls.Add(right);
         Controls.Add(split);
-        Controls.Add(btnPanel);
     }
 
-    // ── actions ──────────────────────────────────────────────────────────
-
-    private void CreateNew()
+    private static Button Btn(string text, Action onClick)
     {
-        using var form = new TemplateConfigForm();
-        if (form.ShowDialog(this) == DialogResult.OK) Reload();
+        var b = new Button { Text = text, Width = 150, Height = 28, Margin = new Padding(0, 2, 0, 2) };
+        b.Click += (_, _) => onClick();
+        return b;
     }
-
-    private void EditSelected()
-    {
-        if (lstTemplates.SelectedItem is not TemplateConfig selected) return;
-        using var form = new TemplateConfigForm(selected);
-        if (form.ShowDialog(this) == DialogResult.OK) Reload();
-    }
-
-    private void DeleteSelected()
-    {
-        if (lstTemplates.SelectedItem is not TemplateConfig selected) return;
-        if (MessageBox.Show(
-                $"Delete template '{selected.ConfigName}'?",
-                "Confirm Delete",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning) != DialogResult.Yes) return;
-
-        ConfigManager.Delete(selected);
-        Reload();
-    }
-
-    // ── helpers ──────────────────────────────────────────────────────────
 
     private void Reload()
     {
         _configs = ConfigManager.LoadAll();
-        lstTemplates.DataSource = null;
-        lstTemplates.DataSource = _configs;
+        listTemplates.DataSource = null;
+        listTemplates.DataSource = _configs;
+        UpdateDetail();
     }
 
-    private void LstTemplates_SelectedIndexChanged(object? sender, EventArgs e)
+    private void UpdateDetail()
     {
-        var sel = lstTemplates.SelectedItem as TemplateConfig;
-        btnEdit.Enabled   = sel != null;
-        btnDelete.Enabled = sel != null;
+        if (listTemplates.SelectedItem is not TemplateConfig c)
+        {
+            lblDetail.Text    = "Select a template to see details.";
+            btnEdit.Enabled   = false;
+            btnDelete.Enabled = false;
+            return;
+        }
+        btnEdit.Enabled = btnDelete.Enabled = true;
+        lblDetail.Text =
+            $"File: {Path.GetFileName(c.TemplatePath)}\n" +
+            $"Exists: {(File.Exists(c.TemplatePath) ? "Yes" : "⚠ Not found")}\n\n" +
+            $"Slides: {c.StaticSlides.Count} static, " +
+            $"{(c.IndexSlide != null ? 1 : 0)} index, " +
+            $"{(c.WordSlide  != null ? 1 : 0)} word\n" +
+            $"Words per index page: {c.WordsPerIndexPage}\n" +
+            $"Index format: {c.IndexLineFormat}\n" +
+            $"Hyperlinks: {(c.HyperlinkIndex ? "Yes" : "No")}\n\n" +
+            $"Created: {c.CreatedAt:yyyy-MM-dd}";
+    }
 
-        if (sel == null) { lblDetails.Text = ""; return; }
+    private void Edit()
+    {
+        if (listTemplates.SelectedItem is not TemplateConfig sel) return;
+        using var f = new TemplateConfigForm(sel);
+        if (f.ShowDialog() == DialogResult.OK) Reload();
+    }
 
-        var staticCount = sel.StaticSlides.Count;
-        var hasIndex    = sel.IndexSlide != null;
-        var hasWord     = sel.WordSlide  != null;
-
-        lblDetails.Text =
-            $"File:     {sel.TemplatePath}\n" +
-            $"Slides:   {sel.Slides.Count} total — " +
-                $"{staticCount} static, " +
-                $"{(hasIndex ? 1 : 0)} index, " +
-                $"{(hasWord  ? 1 : 0)} word\n" +
-            $"Index format:  {sel.IndexLineFormat}\n" +
-            $"Hyperlinks:    {(sel.HyperlinkIndex ? "Yes" : "No")}\n" +
-            $"Image placeholder: {sel.ImagePlaceholder}\n" +
-            $"Audio placeholder: {sel.AudioPlaceholder}";
+    private void Delete()
+    {
+        if (listTemplates.SelectedItem is not TemplateConfig sel) return;
+        if (MessageBox.Show($"Delete \"{sel.ConfigName}\"?\n\nThe .pptx file is not deleted.",
+                "Confirm", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        ConfigManager.Delete(sel);
+        Reload();
     }
 }

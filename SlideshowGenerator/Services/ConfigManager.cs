@@ -1,14 +1,14 @@
-using SlideshowGenerator.Models;
+using LanguageCourseSlides.Models;
 using System.Text.Json;
 
-namespace SlideshowGenerator.Services;
+namespace LanguageCourseSlides.Services;
 
 public static class ConfigManager
 {
     private static readonly string ConfigDir =
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "SlideshowGenerator",
+            "LanguageCourseSlides",
             "templates");
 
     private static readonly JsonSerializerOptions JsonOpts = new()

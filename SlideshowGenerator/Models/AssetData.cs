@@ -1,4 +1,4 @@
-namespace SlideshowGenerator.Models;
+namespace LanguageCourseSlides.Models;
 
 /// <summary>
 /// Carries image or audio data from either a file path or bytes

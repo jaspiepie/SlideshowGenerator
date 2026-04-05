@@ -1,10 +1,10 @@
 using ClosedXML.Excel;
 using ClosedXML.Excel.Drawings;
-using SlideshowGenerator.Models;
+using LanguageCourseSlides.Models;
 using System.IO.Packaging;
 using System.Xml;
 
-namespace SlideshowGenerator.Services;
+namespace LanguageCourseSlides.Services;
 
 public static class ExcelReader
 {
