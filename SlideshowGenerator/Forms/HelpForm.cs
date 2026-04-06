@@ -239,13 +239,14 @@ Open Manage Templates, select a configuration, click Edit. Changes take effect o
 
 After all word slides are built, the app goes back and fills in the Index slide(s).
 
-## Index Content
+## Index Line Format → Table Columns
 
-The {{Index}} placeholder text box is found and replaced with one paragraph per word. The text of each line is controlled by the Index Line Format setting. Examples:
+The Index Line Format field controls which columns appear in the index table and in what order. Each `{token}` you include becomes one column. The literal text between tokens is ignored — only the tokens matter.
 
-  • {word}                   →  blau
-  • {word} – {english}       →  blau – blue
-  • {n}. {word} ({type})     →  1. blau (Adjective)
+Examples:
+  • {word}                         → 1 column:  Word
+  • {word} {type} {english}        → 3 columns: Word, Type, English
+  • {n} {word} {plural} {type} {english}  → 5 columns: #, Word, Plural, Type, English
 
 ## Hyperlinks
 

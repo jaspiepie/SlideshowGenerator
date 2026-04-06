@@ -84,12 +84,14 @@ public class TemplateConfigForm : Form
         AddFieldRow(fields, row++, "Words per index page:", numWordsPerPage);
 
         // Index format
-        txtIndexFormat = new TextBox { Dock = DockStyle.Fill, Text = "{word}" };
+        txtIndexFormat = new TextBox { Dock = DockStyle.Fill, Text = "{word} {type} {english}" };
         AddFieldRow(fields, row++, "Index line format:", txtIndexFormat);
 
         var hint = new Label
         {
-            Text = "Tokens: {word}  {plural}  {type}  {english}  {n}",
+            Text = "Each token becomes one table column (in the order listed).\n" +
+                   "Available tokens:  {n}  {word}  {plural}  {type}  {english}\n" +
+                   "Example: \"{n} {word} {plural} {type} {english}\" → 5 columns",
             AutoSize = true, ForeColor = Color.Gray,
             Font = new System.Drawing.Font(Font.FontFamily, 8),
         };

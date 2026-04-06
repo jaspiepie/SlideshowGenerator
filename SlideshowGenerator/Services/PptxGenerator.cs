@@ -1,9 +1,11 @@
-using System.Text;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Drawing;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
 using LanguageCourseSlides.Models;
+using System.IO.Compression;
+using System.Text;
+using System.Text.RegularExpressions;
 using A = DocumentFormat.OpenXml.Drawing;
 using P = DocumentFormat.OpenXml.Presentation;
 
@@ -12,12 +14,33 @@ namespace LanguageCourseSlides.Services;
 public static class PptxGenerator
 {
     // -----------------------------------------------------------------------
-    // Shape name constants — these must match names in the .pptx template
+    // Shape name constants — must match names in the .pptx template
     // -----------------------------------------------------------------------
     public const string ShapeAudio = "shape_audio";
     public const string ShapeImage = "shape_image";
     public const string ShapeNext  = "shape_next";
     public const string ShapeIndex = "shape_index";
+
+    // -----------------------------------------------------------------------
+    // PowerPoint requires this action string on every internal slide hyperlink.
+    // Without it, the click is registered but PowerPoint does not jump slides.
+    // The relationship type is the standard "hyperlink" with isExternal=false
+    // (TargetMode="Internal") — this is exactly what PowerPoint itself writes.
+    // -----------------------------------------------------------------------
+    private const string SlideJumpAction = "ppaction://hlinksldjump";
+
+    // -----------------------------------------------------------------------
+    // Column definitions — token → (header label, relative width weight)
+    // -----------------------------------------------------------------------
+    private static readonly IReadOnlyDictionary<string, (string Header, int Weight)> ColDefs =
+        new Dictionary<string, (string, int)>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["{n}"]       = ("#",       1),
+            ["{word}"]    = ("Word",    4),
+            ["{plural}"]  = ("Plural",  3),
+            ["{type}"]    = ("Type",    2),
+            ["{english}"] = ("English", 4),
+        };
 
     // -----------------------------------------------------------------------
     // Public entry point
@@ -34,23 +57,24 @@ public static class PptxGenerator
 
         File.Copy(config.TemplatePath, outputPath, overwrite: true);
 
+        // Populated during naming; used by PostRenameSlides after the SDK closes the file.
+        var nameMap = new Dictionary<string, string>(); // auto-name (slide4.xml) → desired (Slide_der_Hund.xml)
+
         using var doc    = PresentationDocument.Open(outputPath, isEditable: true);
         var presPart     = doc.PresentationPart!;
         var presentation = presPart.Presentation;
         var slideIdList  = presentation.SlideIdList!;
 
-        // Snapshot original template slides
         var templateIds   = slideIdList.Elements<SlideId>().ToList();
         var templateParts = templateIds
             .Select(id => (SlidePart)presPart.GetPartById(id.RelationshipId!))
             .ToList();
 
-        // ── PASS 1: Build output slide list ───────────────────────────────
-        // Each item: (SlidePart, SlideRole, WordEntry?, indexPageEntries?)
-        var output = new List<OutputSlide>();
-        int done   = 0;
+        var columns = ParseColumns(config.IndexLineFormat);
 
-        // How many index pages do we need?
+        // ── PASS 1: Clone all output slides ──────────────────────────────
+        var output       = new List<OutputSlide>();
+        int done         = 0;
         int wordsPerPage = Math.Max(1, config.WordsPerIndexPage);
 
         foreach (var def in config.Slides.OrderBy(s => s.SlideIndex))
@@ -65,9 +89,9 @@ public static class PptxGenerator
                     break;
 
                 case SlideRole.Index:
-                    // One index slide per batch of wordsPerPage entries
-                    int totalIndexPages = Math.Max(1, (int)Math.Ceiling(entries.Count / (double)wordsPerPage));
-                    for (int page = 0; page < totalIndexPages; page++)
+                    int totalPages = Math.Max(1,
+                        (int)Math.Ceiling(entries.Count / (double)wordsPerPage));
+                    for (int page = 0; page < totalPages; page++)
                     {
                         var batch = entries
                             .Skip(page * wordsPerPage)
@@ -75,8 +99,9 @@ public static class PptxGenerator
                             .ToList();
                         output.Add(new OutputSlide(CloneSlide(presPart, source), SlideRole.Index)
                         {
-                            IndexEntries = batch,
-                            IndexPage    = page + 1,
+                            IndexEntries    = batch,
+                            IndexPage       = page + 1,
+                            GlobalRowOffset = page * wordsPerPage,
                         });
                     }
                     break;
@@ -93,71 +118,391 @@ public static class PptxGenerator
             }
         }
 
-        // ── Remove old template slides; register new ones ─────────────────
+        // ── Remove template slides; register new ones ─────────────────────
         foreach (var id   in templateIds)   slideIdList.RemoveChild(id);
         foreach (var part in templateParts) presPart.DeletePart(part);
 
         uint sid = 256;
-        for (int i = 0; i < output.Count; i++)
+        foreach (var item in output)
         {
-            var relId = presPart.GetIdOfPart(output[i].Part);
+            var relId = presPart.GetIdOfPart(item.Part);
             slideIdList.Append(new SlideId { Id = sid++, RelationshipId = relId });
         }
 
-        // ── Name each slide (sets <p:cSld name="...">) ────────────────────
+        // ── Name every slide ──────────────────────────────────────────────
+        bool multiIndex = output.Count(o => o.Role == SlideRole.Index) > 1;
         for (int i = 0; i < output.Count; i++)
         {
             var item = output[i];
             string name = item.Role switch
             {
                 SlideRole.Static => $"Slide_{i + 1:000}_static",
-                SlideRole.Index  => output.Count(o => o.Role == SlideRole.Index) > 1
-                                     ? $"Slide_Index_{item.IndexPage}"
-                                     : "Slide_Index",
+                SlideRole.Index  => multiIndex
+                                    ? $"Slide_Index_{item.IndexPage}"
+                                    : "Slide_Index",
                 SlideRole.Word   => $"Slide_{SanitizeName(item.Entry!.Word)}",
                 _                => $"Slide_{i + 1:000}",
             };
             SetSlideName(item.Part, name);
+            // Track the SDK's auto-generated filename so PostRenameSlides can update it.
+            string autoName = item.Part.Uri.OriginalString.Split('/').Last(); // e.g. "slide4.xml"
+            nameMap[autoName] = name + ".xml";                                // → "Slide_der_Hund.xml"
         }
 
-        // ── PASS 2: Populate index slides & wire navigation shapes ─────────
+        // ── PASS 2A: Build index tables ───────────────────────────────────
+        // Must run after all slides are named so the hyperlink targets
+        // (derived from cSld name) are already set.
 
-        // First index slide position (1-based) — shape_index links here
-        int firstIndexPos = output.FindIndex(o => o.Role == SlideRole.Index) + 1;
+        var wordPartMap = new Dictionary<WordEntry, SlidePart>();
+        foreach (var item in output)
+            if (item.Role == SlideRole.Word && item.Entry != null)
+                wordPartMap[item.Entry] = item.Part;
 
-        // Build word-entry → 1-based slide position map
-        var wordSlidePos = new Dictionary<WordEntry, int>();
-        for (int i = 0; i < output.Count; i++)
-            if (output[i].Role == SlideRole.Word && output[i].Entry != null)
-                wordSlidePos[output[i].Entry!] = i + 1;
+        SlidePart? firstIndexPart = output
+            .FirstOrDefault(o => o.Role == SlideRole.Index)?.Part;
+
+        foreach (var item in output)
+        {
+            if (item.Role == SlideRole.Index)
+            {
+                BuildIndexTable(
+                    item.Part, item.IndexEntries, wordPartMap,
+                    columns, item.GlobalRowOffset, config.HyperlinkIndex);
+            }
+        }
+
+        // ── PASS 2B: Wire navigation buttons ─────────────────────────────
+        // Runs last so shape_next and shape_index are resolved against
+        // fully-named, fully-registered slides.
 
         for (int i = 0; i < output.Count; i++)
         {
             var item = output[i];
-
-            if (item.Role == SlideRole.Index)
+            if (item.Role == SlideRole.Word)
             {
-                BuildIndexContent(
-                    item.Part,
-                    item.IndexEntries,
-                    wordSlidePos,
-                    config.IndexLineFormat,
-                    config.HyperlinkIndex);
-            }
-            else if (item.Role == SlideRole.Word)
-            {
-                int nextPos  = i + 2; // next slide (1-based), wraps if last
-                if (nextPos > output.Count) nextPos = firstIndexPos > 0 ? firstIndexPos : 1;
+                SlidePart? nextPart = (i + 1 < output.Count)
+                    ? output[i + 1].Part
+                    : firstIndexPart;
 
-                WireNavigationShapes(item.Part, nextPos, firstIndexPos, output.Count);
+                WireNavigationShapes(item.Part, nextPart, firstIndexPart);
             }
         }
 
         presentation.Save();
+
+        doc.Save();
+
+        // Explicitly dispose (close the file handle) before manipulating the ZIP.
+        // The using var will call Dispose() again at method end — that is a safe no-op.
+        doc.Dispose();
+        PostRenameSlides(outputPath, nameMap);
+    }
+
+    // -----------------------------------------------------------------------
+    // Create an internal hyperlink relationship to another slide.
+    //
+    // The target must be the slide's ACTUAL filename within the package
+    // (e.g. "slide4.xml") so PowerPoint can confirm the relationship is
+    // internal.  Uri.Segments throws on relative URIs, so we split
+    // OriginalString to extract the filename safely.
+    //
+    // isExternal: false  →  TargetMode="Internal" in the .rels file.
+    // action="ppaction://hlinksldjump" on the hlinkClick element tells
+    // PowerPoint to perform a slide jump rather than a shell-open.
+    // -----------------------------------------------------------------------
+    private static string AddSlideHyperlink(OpenXmlPart source, string target)
+    {
+        var rel = source.AddHyperlinkRelationship(
+            new Uri(target, UriKind.Relative),
+            isExternal: false);
+
+        return rel.Id;
+    }
+
+    // Overload that accepts a SlidePart — uses the slide's actual package filename
+    // (e.g. "slide4.xml") so the TargetMode="Internal" relationship can be
+    // resolved to a real part in the package.
+    // Uri.Segments throws on relative URIs, so OriginalString.Split is used.
+    private static string AddSlideHyperlink(OpenXmlPart source, SlidePart target)
+    {
+        string filename = target.Uri.OriginalString.Split('/').Last();
+        return AddSlideHyperlink(source, filename);
     }
 
     // =======================================================================
-    // Word slide — text substitution + asset handling
+    // Column parser
+    // =======================================================================
+
+    private static List<string> ParseColumns(string format)
+    {
+        var tokens = Regex.Matches(format, @"\{[a-z]+\}", RegexOptions.IgnoreCase)
+            .Select(m => m.Value.ToLowerInvariant())
+            .Where(t => ColDefs.ContainsKey(t))
+            .Distinct()
+            .ToList();
+
+        if (tokens.Count == 0) tokens.Add("{word}");
+        return tokens;
+    }
+
+    // =======================================================================
+    // Index table builder
+    // =======================================================================
+
+    private static void BuildIndexTable(
+        SlidePart                        indexPart,
+        List<WordEntry>                  entries,
+        Dictionary<WordEntry, SlidePart> wordPartMap,
+        List<string>                     columns,
+        int                              rowOffset,
+        bool                             hyperlink)
+    {
+        var slide = indexPart.Slide;
+
+        P.Shape? placeholder = FindShapeContainingText(slide, "{{Index}}");
+        if (placeholder == null) return;
+
+        var xfrm = placeholder.ShapeProperties?.Transform2D;
+        long x  = xfrm?.Offset?.X  ?? 457_200L;
+        long y  = xfrm?.Offset?.Y  ?? 914_400L;
+        long cx = xfrm?.Extents?.Cx ?? 8_229_600L;
+        long cy = xfrm?.Extents?.Cy ?? 3_657_600L;
+
+        placeholder.Remove();
+
+        int  totalWeight = columns.Sum(c => ColDefs[c].Weight);
+        var  colWidths   = columns
+            .Select(c => (long)(cx * ColDefs[c].Weight / (double)totalWeight))
+            .ToList();
+
+        long hdrH = 457_200L;
+        long rowH = entries.Count > 0
+            ? Math.Max(304_800L, (cy - hdrH) / entries.Count)
+            : 304_800L;
+
+        var gf = BuildTableFrame(
+            indexPart, entries, wordPartMap, columns, colWidths,
+            x, y, cx, hdrH, rowH, rowOffset, hyperlink);
+
+        slide.CommonSlideData?.ShapeTree?.Append(gf);
+        indexPart.Slide.Save();
+    }
+
+    private static P.Shape? FindShapeContainingText(P.Slide slide, string text) =>
+        slide.Descendants<P.Shape>()
+             .FirstOrDefault(sp => sp.InnerText.Contains(text));
+
+    // =======================================================================
+    // GraphicFrame + Table
+    // =======================================================================
+
+    private static P.GraphicFrame BuildTableFrame(
+        SlidePart                        indexPart,
+        List<WordEntry>                  entries,
+        Dictionary<WordEntry, SlidePart> wordPartMap,
+        List<string>                     columns,
+        List<long>                       colWidths,
+        long x, long y, long cx,
+        long hdrH, long rowH,
+        int  rowOffset,
+        bool hyperlink)
+    {
+        long frameCy = hdrH + rowH * entries.Count;
+
+        var gf = new P.GraphicFrame();
+
+        gf.Append(new P.NonVisualGraphicFrameProperties(
+            new P.NonVisualDrawingProperties { Id = 10, Name = "Index Table" },
+            new P.NonVisualGraphicFrameDrawingProperties(
+                new A.GraphicFrameLocks { NoGrouping = true }),
+            new ApplicationNonVisualDrawingProperties()));
+
+        gf.Append(new P.Transform(
+            new A.Offset  { X = x,  Y = y  },
+            new A.Extents { Cx = cx, Cy = frameCy }));
+
+        var tbl   = new A.Table();
+        var tblPr = new A.TableProperties { FirstRow = true, BandRow = true };
+        tblPr.Append(new A.TableStyleId
+            { Text = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}" });
+        tbl.Append(tblPr);
+
+        var tblGrid = new A.TableGrid();
+        foreach (var w in colWidths)
+            tblGrid.Append(new A.GridColumn { Width = w });
+        tbl.Append(tblGrid);
+
+        tbl.Append(BuildHeaderRow(columns, hdrH));
+
+        for (int i = 0; i < entries.Count; i++)
+        {
+            tbl.Append(BuildDataRow(
+                indexPart, entries[i], wordPartMap, columns,
+                rowNumber: i + rowOffset + 1,
+                height:    rowH,
+                altRow:    i % 2 == 1,
+                hyperlink: hyperlink));
+        }
+
+        gf.Append(new A.Graphic(
+            new A.GraphicData(tbl)
+            {
+                Uri = "http://schemas.openxmlformats.org/drawingml/2006/table"
+            }));
+
+        return gf;
+    }
+
+    // ── Header row ────────────────────────────────────────────────────────
+
+    private static A.TableRow BuildHeaderRow(List<string> columns, long height)
+    {
+        var tr = new A.TableRow { Height = height };
+
+        foreach (var col in columns)
+        {
+            var tc     = new A.TableCell();
+            var txBody = new A.TextBody(
+                new A.BodyProperties(),
+                new A.ListStyle(),
+                MakeParagraph(ColDefs[col].Header,
+                              bold: true, fontSize: 12,
+                              colorHex: "FFFFFF",
+                              align: A.TextAlignmentTypeValues.Left));
+            tc.Append(txBody);
+
+            var tcPr = new A.TableCellProperties();
+            tcPr.Append(new A.SolidFill(
+                new A.RgbColorModelHex { Val = "1C4E80" }));
+            tc.Append(tcPr);
+            tr.Append(tc);
+        }
+
+        return tr;
+    }
+
+    // ── Data row ──────────────────────────────────────────────────────────
+
+    private static A.TableRow BuildDataRow(
+        SlidePart                        indexPart,
+        WordEntry                        entry,
+        Dictionary<WordEntry, SlidePart> wordPartMap,
+        List<string>                     columns,
+        int                              rowNumber,
+        long                             height,
+        bool                             altRow,
+        bool                             hyperlink)
+    {
+        var tr         = new A.TableRow { Height = height };
+        int wordColIdx = columns.IndexOf("{word}");
+
+        for (int c = 0; c < columns.Count; c++)
+        {
+            string token  = columns[c];
+            string value  = GetEntryValue(entry, token, rowNumber);
+            bool   isWord = c == wordColIdx;
+
+            var         tc   = new A.TableCell();
+            A.Paragraph para;
+
+            if (isWord && hyperlink && wordPartMap.TryGetValue(entry, out SlidePart? targetPart))
+            {
+                // Use the actual package filename so TargetMode="Internal" resolves
+                // to a real part in the package.
+                string filename = targetPart.Uri.OriginalString.Split('/').Last();
+
+                string relId = AddSlideHyperlink(indexPart, filename);
+                para = MakeHyperlinkParagraph(value, relId, fontSize: 11);
+            }
+            else
+            {
+                para = MakeParagraph(value,
+                    bold:     false,
+                    fontSize: 11,
+                    colorHex: "333333",
+                    align:    token == "{n}"
+                              ? A.TextAlignmentTypeValues.Center
+                              : A.TextAlignmentTypeValues.Left);
+            }
+
+            tc.Append(new A.TextBody(
+                new A.BodyProperties(),
+                new A.ListStyle(),
+                para));
+
+            var tcPr = new A.TableCellProperties();
+            if (altRow)
+                tcPr.Append(new A.SolidFill(
+                    new A.RgbColorModelHex { Val = "F2F2F2" }));
+            tc.Append(tcPr);
+            tr.Append(tc);
+        }
+
+        return tr;
+    }
+
+    // ── Paragraph builders ────────────────────────────────────────────────
+
+    private static A.Paragraph MakeParagraph(
+        string text, bool bold, int fontSize, string colorHex,
+        A.TextAlignmentTypeValues align)
+    {
+        var pPr = new A.ParagraphProperties { Alignment = align };
+
+        var rPr = new A.RunProperties { Language = "en-US", Dirty = false };
+        rPr.Append(new A.SolidFill(new A.RgbColorModelHex { Val = colorHex }));
+        if (bold) rPr.Bold = true;
+        rPr.FontSize = fontSize * 100;
+
+        var run = new A.Run();
+        run.Append(rPr);
+        run.Append(new A.Text(text));
+
+        var para = new A.Paragraph();
+        para.Append(pPr);
+        para.Append(run);
+        return para;
+    }
+
+    private static A.Paragraph MakeHyperlinkParagraph(
+        string text, string relId, int fontSize)
+    {
+        var pPr = new A.ParagraphProperties
+            { Alignment = A.TextAlignmentTypeValues.Left };
+
+        var rPr = new A.RunProperties { Language = "en-US", Dirty = false };
+        rPr.Append(new A.SolidFill(new A.RgbColorModelHex { Val = "0073AE" }));
+        rPr.FontSize = fontSize * 100;
+
+        // action="ppaction://hlinksldjump" is what makes PowerPoint jump slides.
+        // Without it the link is ignored, even with a valid relationship.
+        rPr.InsertAt(
+            new A.HyperlinkOnClick { Id = relId, Action = SlideJumpAction }, 0);
+
+        var run = new A.Run();
+        run.Append(rPr);
+        run.Append(new A.Text(text));
+
+        var para = new A.Paragraph();
+        para.Append(pPr);
+        para.Append(run);
+        return para;
+    }
+
+    // ── Value getter ──────────────────────────────────────────────────────
+
+    private static string GetEntryValue(WordEntry e, string token, int n) => token switch
+    {
+        "{n}"       => n.ToString(),
+        "{word}"    => e.Word,
+        "{plural}"  => e.Plural,
+        "{type}"    => e.Type,
+        "{english}" => e.English,
+        _           => "",
+    };
+
+    // =======================================================================
+    // Word slide processing
     // =======================================================================
 
     private static void ProcessWordSlide(
@@ -165,178 +510,90 @@ public static class PptxGenerator
         WordEntry      entry,
         TemplateConfig config)
     {
-        // 1. Merge split runs so {{placeholders}} are intact strings
         MergeTextRuns(slidePart);
-
-        // 2. Replace all {{Field}} text placeholders via raw XML
         SubstitutePlaceholders(slidePart, entry.ToPlaceholders());
 
-        // 3. Image — find by shape name
         if (entry.HasImage)
             InjectImage(slidePart, entry.Image!, ShapeImage);
         else
             RemoveShapeByName(slidePart, ShapeImage);
 
-        // 4. Audio — find by shape name
         if (entry.HasAudio)
             InjectAudio(slidePart, entry.Audio!, ShapeAudio);
         else
             RemoveShapeByName(slidePart, ShapeAudio);
 
-        // shape_next and shape_index wired in Pass 2 once slide order is known
         slidePart.Slide.Save();
     }
 
     // =======================================================================
-    // Navigation shapes on word slides (Pass 2)
+    // Navigation shapes (shape_next, shape_index on word slides)
     // =======================================================================
 
     private static void WireNavigationShapes(
-        SlidePart slidePart,
-        int       nextSlidePos,
-        int       indexSlidePos,
-        int       totalSlides)
+        SlidePart  wordPart,
+        SlidePart? nextPart,
+        SlidePart? indexPart)
     {
-        // shape_next → hyperlink to next slide
-        var nextShape = FindShapeByName(slidePart, ShapeNext);
-        if (nextShape != null && nextSlidePos >= 1 && nextSlidePos <= totalSlides)
+        var nextShape = FindShapeByName(wordPart, ShapeNext);
+        if (nextShape != null && nextPart != null)
         {
-            var rel = slidePart.AddHyperlinkRelationship(
-                new Uri($"slide{nextSlidePos}.xml", UriKind.Relative), false);
-            EnsureClickAction(nextShape, rel.Id);
+            string relId = AddSlideHyperlink(wordPart, nextPart);
+            SetShapeHlinkClick(nextShape, relId);
         }
 
-        // shape_index → hyperlink back to index
-        var idxShape = FindShapeByName(slidePart, ShapeIndex);
-        if (idxShape != null && indexSlidePos >= 1)
+        var idxShape = FindShapeByName(wordPart, ShapeIndex);
+        if (idxShape != null && indexPart != null)
         {
-            var rel = slidePart.AddHyperlinkRelationship(
-                new Uri($"slide{indexSlidePos}.xml", UriKind.Relative), false);
-            EnsureClickAction(idxShape, rel.Id);
+            string relId = AddSlideHyperlink(wordPart, indexPart);
+            SetShapeHlinkClick(idxShape, relId);
         }
 
-        slidePart.Slide.Save();
+        wordPart.Slide.Save();
     }
 
-    private static void EnsureClickAction(P.Shape shape, string relId)
+    private static void SetShapeHlinkClick(P.Shape shape, string relId)
     {
-        // Add a hlinkClick to every run in the shape, or to the shape's spPr
-        // The easiest approach: add to NonVisualShapeDrawingProperties
-        var nvSpPr = shape.NonVisualShapeProperties;
-        if (nvSpPr == null) return;
-
-        var cNvPr = nvSpPr.NonVisualDrawingProperties;
+        var cNvPr = shape.NonVisualShapeProperties?.NonVisualDrawingProperties;
         if (cNvPr == null) return;
 
-        // Remove any existing hyperlink on click first
-        var existing = cNvPr.Elements<A.HyperlinkOnClick>().FirstOrDefault();
-        existing?.Remove();
+        // Remove any shape-level hyperlink the template may have left behind.
+        cNvPr.Elements<A.HyperlinkOnClick>().ToList().ForEach(h => h.Remove());
 
-        cNvPr.Append(new A.HyperlinkOnClick { Id = relId });
+        // Also strip hyperlinks from every text run inside the shape.
+        // If the template set the hyperlink on the text rather than the shape,
+        // the cloned slide keeps that r:id reference even though the relationship
+        // is not copied — PowerPoint then falls back to opening "#Slide N"
+        // via Windows Shell, producing the "Windows cannot find #Slide N" error.
+        foreach (var rPr in shape.Descendants<A.RunProperties>())
+            rPr.Elements<A.HyperlinkOnClick>().ToList().ForEach(h => h.Remove());
+
+        // Place hlinkClick at index 0: per CT_NonVisualDrawingProps schema the
+        // sequence is hlinkClick → hlinkHover → extLst.  Append would put it
+        // after extLst (a schema violation PowerPoint silently ignores the link).
+        cNvPr.InsertAt(new A.HyperlinkOnClick { Id = relId, Action = SlideJumpAction }, 0);
+
+        // Also wire every text run so a click anywhere on the shape triggers
+        // the link — this is the same mechanism confirmed working for index links.
+        foreach (var rPr in shape.Descendants<A.RunProperties>())
+            rPr.InsertAt(new A.HyperlinkOnClick { Id = relId, Action = SlideJumpAction }, 0);
     }
 
     // =======================================================================
-    // Index content builder — pure DOM, no raw XML replacement
+    // Shape finders
     // =======================================================================
 
-    private static void BuildIndexContent(
-        SlidePart                  indexPart,
-        List<WordEntry>            entries,
-        Dictionary<WordEntry, int> wordSlidePos,
-        string                     lineFormat,
-        bool                       hyperlink)
-    {
-        var slide = indexPart.Slide;
+    private static P.Shape? FindShapeByName(SlidePart slidePart, string name) =>
+        slidePart.Slide.Descendants<P.Shape>()
+            .FirstOrDefault(sp => string.Equals(
+                sp.NonVisualShapeProperties?.NonVisualDrawingProperties?.Name?.Value,
+                name, StringComparison.OrdinalIgnoreCase));
 
-        // Merge split runs first
-        MergeTextRuns(indexPart);
-
-        // Find the paragraph containing {{Index}} in any text body on this slide
-        A.Paragraph? targetPara = null;
-        A.TextBody?  txBody     = null;
-
-        foreach (var para in slide.Descendants<A.Paragraph>())
-        {
-            if (para.InnerText.Contains("{{Index}}"))
-            {
-                targetPara = para;
-                txBody     = para.Ancestors<A.TextBody>().FirstOrDefault();
-                break;
-            }
-        }
-
-        if (targetPara == null || txBody == null)
-        {
-            // Fallback: search every text body for any {{…}} and dump raw text
-            // (template may not have {{Index}} — nothing we can do without it)
-            return;
-        }
-
-        // Capture run/paragraph formatting from the placeholder paragraph
-        var templateRun = targetPara.Elements<A.Run>().FirstOrDefault();
-        var templatePPr = targetPara
-            .Elements<A.ParagraphProperties>()
-            .FirstOrDefault()
-            ?.CloneNode(true) as A.ParagraphProperties;
-
-        // Remove placeholder paragraph
-        targetPara.Remove();
-
-        // Insert one paragraph per entry
-        for (int i = 0; i < entries.Count; i++)
-        {
-            var entry    = entries[i];
-            var lineText = FormatLine(lineFormat, i + 1, entry);
-
-            var para = new A.Paragraph();
-            if (templatePPr != null)
-                para.Append((A.ParagraphProperties)templatePPr.CloneNode(true));
-
-            var rPr = CloneRunProperties(templateRun);
-            rPr.Dirty = false;
-
-            if (hyperlink && wordSlidePos.TryGetValue(entry, out int targetPos))
-            {
-                var rel = indexPart.AddHyperlinkRelationship(
-                    new Uri($"slide{targetPos}.xml", UriKind.Relative), false);
-                rPr.InsertAt(new A.HyperlinkOnClick { Id = rel.Id }, 0);
-            }
-
-            var run = new A.Run();
-            run.Append(rPr);
-            run.Append(new A.Text(lineText));
-            para.Append(run);
-            txBody.Append(para);
-        }
-
-        indexPart.Slide.Save();
-    }
+    private static void RemoveShapeByName(SlidePart slidePart, string name) =>
+        FindShapeByName(slidePart, name)?.Remove();
 
     // =======================================================================
-    // Shape finder by PowerPoint shape name (<p:cNvPr name="...">)
-    // =======================================================================
-
-    private static P.Shape? FindShapeByName(SlidePart slidePart, string name)
-    {
-        return slidePart.Slide
-            .Descendants<P.Shape>()
-            .FirstOrDefault(sp =>
-                string.Equals(
-                    sp.NonVisualShapeProperties
-                      ?.NonVisualDrawingProperties
-                      ?.Name?.Value,
-                    name,
-                    StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static void RemoveShapeByName(SlidePart slidePart, string name)
-    {
-        var shape = FindShapeByName(slidePart, name);
-        shape?.Remove();
-    }
-
-    // =======================================================================
-    // Image injection — replaces shape_image with the actual picture
+    // Image injection
     // =======================================================================
 
     private static void InjectImage(SlidePart slidePart, AssetData asset, string shapeName)
@@ -353,8 +610,7 @@ public static class PptxGenerator
         long cy = xfrm.Extents?.Cy ?? 1_000_000;
 
         var imagePart = slidePart.AddImagePart(asset.ContentType);
-        using (var stream = asset.OpenStream())
-            imagePart.FeedData(stream);
+        using (var stream = asset.OpenStream()) imagePart.FeedData(stream);
 
         var relId = slidePart.GetIdOfPart(imagePart);
         var pic   = BuildPicture(relId, shapeName, x, y, cx, cy);
@@ -386,17 +642,14 @@ public static class PptxGenerator
     }
 
     // =======================================================================
-    // Audio injection — attaches media to shape_audio
+    // Audio injection
     // =======================================================================
 
     private static void InjectAudio(SlidePart slidePart, AssetData asset, string shapeName)
     {
         var shape = FindShapeByName(slidePart, shapeName);
 
-        // Default position if shape not found
-        long x  = 457_200, y  = 457_200;
-        long cx = 457_200, cy = 457_200;
-
+        long x = 457_200, y = 457_200, cx = 457_200, cy = 457_200;
         if (shape?.ShapeProperties?.Transform2D is { } xfrm)
         {
             x  = xfrm.Offset?.X  ?? x;
@@ -413,19 +666,16 @@ public static class PptxGenerator
         }
         catch
         {
-            mediaPart = slidePart.OpenXmlPackage.CreateMediaDataPart("audio/mpeg", ".mp3");
+            mediaPart = slidePart.OpenXmlPackage.CreateMediaDataPart(
+                "audio/mpeg", ".mp3");
         }
 
-        using (var s = asset.OpenStream())
-            mediaPart.FeedData(s);
+        using (var s = asset.OpenStream()) mediaPart.FeedData(s);
 
         var audioRelId = slidePart.AddAudioReferenceRelationship(mediaPart).Id;
         var mediaRelId = slidePart.AddMediaReferenceRelationship(mediaPart).Id;
 
-        var audioShape = BuildAudioShape(
-            audioRelId, mediaRelId,
-            shapeName, x, y, cx, cy);
-
+        var audioShape = BuildAudioShape(audioRelId, mediaRelId, shapeName, x, y, cx, cy);
         slidePart.Slide.CommonSlideData?.ShapeTree?.Append(audioShape);
         shape?.Remove();
     }
@@ -436,21 +686,20 @@ public static class PptxGenerator
     {
         var pic   = new P.Picture();
         var nvPPr = new P.NonVisualPictureProperties();
-
         var cNvPr = new P.NonVisualDrawingProperties { Id = 200, Name = name };
-        cNvPr.Append(new A.HyperlinkOnClick { Id = audioRelId, Action = "ppaction://media" });
+        cNvPr.Append(new A.HyperlinkOnClick
+            { Id = audioRelId, Action = "ppaction://media" });
         nvPPr.Append(cNvPr);
         nvPPr.Append(new P.NonVisualPictureDrawingProperties());
-
         var appNvPr = new ApplicationNonVisualDrawingProperties();
         appNvPr.Append(new AudioFromFile { Link = mediaRelId });
         nvPPr.Append(appNvPr);
-
         pic.Append(nvPPr);
-        pic.Append(new P.BlipFill(new A.Blip(), new A.Stretch(new A.FillRectangle())));
+        pic.Append(new P.BlipFill(
+            new A.Blip(), new A.Stretch(new A.FillRectangle())));
         pic.Append(new P.ShapeProperties(
             new A.Transform2D(
-                new A.Offset  { X = x,  Y = y  },
+                new A.Offset  { X = x, Y = y },
                 new A.Extents { Cx = cx, Cy = cy }),
             new A.PresetGeometry(new A.AdjustValueList())
                 { Preset = A.ShapeTypeValues.Rectangle }));
@@ -458,7 +707,7 @@ public static class PptxGenerator
     }
 
     // =======================================================================
-    // Slide naming
+    // Helpers
     // =======================================================================
 
     private static void SetSlideName(SlidePart slidePart, string name)
@@ -475,71 +724,135 @@ public static class PptxGenerator
         return sb.ToString().Trim('_');
     }
 
-    // =======================================================================
-    // Shared helpers
-    // =======================================================================
-
     private static SlidePart CloneSlide(PresentationPart presPart, SlidePart source)
     {
         var newPart = presPart.AddNewPart<SlidePart>();
-        using (var stream = source.GetStream())
-            newPart.FeedData(stream);
+        using (var stream = source.GetStream()) newPart.FeedData(stream);
         foreach (var rel in source.Parts)
             newPart.AddPart(rel.OpenXmlPart, rel.RelationshipId);
         return newPart;
     }
 
-    /// <summary>
-    /// Raw XML string-replace for {{Field}} text placeholders on word slides only.
-    /// Values are XML-escaped. Not used for index content.
-    /// </summary>
     private static void SubstitutePlaceholders(
         SlidePart slidePart, Dictionary<string, string> map)
     {
         string xml;
-        using (var r = new StreamReader(slidePart.GetStream()))
-            xml = r.ReadToEnd();
-
+        using (var r = new StreamReader(slidePart.GetStream())) xml = r.ReadToEnd();
         foreach (var (key, value) in map)
             xml = xml.Replace(key, System.Security.SecurityElement.Escape(value ?? ""));
-
         using var w = new StreamWriter(slidePart.GetStream(FileMode.Create));
         w.Write(xml);
     }
 
-    /// <summary>
-    /// Merge runs within paragraphs that contain {{ so a split placeholder
-    /// becomes a single run before DOM search/replace.
-    /// </summary>
     private static void MergeTextRuns(SlidePart slidePart)
     {
         foreach (var para in slidePart.Slide.Descendants<A.Paragraph>().ToList())
         {
             var runs = para.Elements<A.Run>().ToList();
             if (runs.Count < 2) continue;
-
             var combined = string.Concat(runs.Select(r => r.Text?.Text ?? ""));
             if (!combined.Contains("{{")) continue;
-
             runs[0].Text = new A.Text(combined);
-            for (int i = 1; i < runs.Count; i++)
-                runs[i].Remove();
+            for (int i = 1; i < runs.Count; i++) runs[i].Remove();
         }
     }
 
-    private static A.RunProperties CloneRunProperties(A.Run? source)
+    // =======================================================================
+    // Post-process: rename slide files inside the .pptx ZIP so that the
+    // package filenames match the display names set by SetSlideName.
+    //
+    // The Open XML SDK auto-generates URIs like "slide4.xml".  After the SDK
+    // closes the file, we rename every slide part to its desired name
+    // (e.g. "Slide_der_Hund.xml") and patch every .rels / content-types
+    // reference, so that internal hyperlinks resolve to real package parts.
+    // =======================================================================
+
+    private static void PostRenameSlides(
+        string outputPath,
+        IReadOnlyDictionary<string, string> nameMap)
     {
-        if (source?.RunProperties != null)
-            return (A.RunProperties)source.RunProperties.CloneNode(true);
-        return new A.RunProperties { Language = "en-US", Dirty = false };
+        if (nameMap.Count == 0) return;
+
+        using var zip = ZipFile.Open(outputPath, ZipArchiveMode.Update);
+
+        // 1. Rename ppt/slides/slide{N}.xml → ppt/slides/Slide_{word}.xml
+        foreach (var (oldName, newName) in nameMap)
+            RenameZipEntry(zip, $"ppt/slides/{oldName}", $"ppt/slides/{newName}");
+
+        // 2. Rename ppt/slides/_rels/slide{N}.xml.rels → ppt/slides/_rels/Slide_{word}.xml.rels
+        foreach (var (oldName, newName) in nameMap)
+            RenameZipEntry(zip, $"ppt/slides/_rels/{oldName}.rels",
+                                $"ppt/slides/_rels/{newName}.rels");
+
+        // 3. Update slide targets in ppt/_rels/presentation.xml.rels
+        PatchZipEntry(zip, "ppt/_rels/presentation.xml.rels",
+            c => ReplaceQuotedRefs(c, nameMap, "slides/"));
+
+        // 4. Update hyperlink targets inside each slide's .rels file.
+        //    Files were already renamed in step 2, so iterate over new names.
+        foreach (var newName in nameMap.Values)
+            PatchZipEntry(zip, $"ppt/slides/_rels/{newName}.rels",
+                c => ReplaceQuotedRefs(c, nameMap, ""));
+
+        // 5. Update Override PartNames in [Content_Types].xml
+        PatchZipEntry(zip, "[Content_Types].xml",
+            c => ReplaceQuotedRefs(c, nameMap, "/ppt/slides/"));
     }
 
-    private static string FormatLine(string fmt, int n, WordEntry e) =>
-        fmt.Replace("{n}",       n.ToString())
-           .Replace("{word}",    e.Word)
-           .Replace("{plural}",  e.Plural)
-           .Replace("{type}",    e.Type)
-           .Replace("{english}", e.English);
+    // Replace quoted occurrences of each old filename with the new filename.
+    // Using surrounding double-quotes prevents "slide1.xml" from matching inside
+    // "slide10.xml" or "slideLayout1.xml".
+    private static string ReplaceQuotedRefs(
+        string content,
+        IReadOnlyDictionary<string, string> nameMap,
+        string prefix)
+    {
+        foreach (var (oldName, newName) in nameMap)
+            content = content.Replace(
+                $"\"{prefix}{oldName}\"",
+                $"\"{prefix}{newName}\"");
+        return content;
+    }
+
+    private static void RenameZipEntry(ZipArchive zip, string oldPath, string newPath)
+    {
+        var oldEntry = zip.GetEntry(oldPath);
+        if (oldEntry == null) return;
+
+        // Read all bytes first — the stream must be closed before deleting the entry.
+        byte[] data;
+        using (var src = oldEntry.Open())
+        using (var ms  = new MemoryStream())
+        {
+            src.CopyTo(ms);
+            data = ms.ToArray();
+        }
+
+        oldEntry.Delete();
+
+        var newEntry = zip.CreateEntry(newPath, CompressionLevel.Optimal);
+        using var dst = newEntry.Open();
+        dst.Write(data, 0, data.Length);
+    }
+
+    private static void PatchZipEntry(ZipArchive zip, string path, Func<string, string> patch)
+    {
+        var entry = zip.GetEntry(path);
+        if (entry == null) return;
+
+        string content;
+        using (var stream = entry.Open())
+        using (var reader = new StreamReader(stream))
+            content = reader.ReadToEnd();
+
+        string patched = patch(content);
+        if (patched == content) return; // nothing changed
+
+        entry.Delete();
+        var newEntry = zip.CreateEntry(path, CompressionLevel.Optimal);
+        using var writer = new StreamWriter(newEntry.Open());
+        writer.Write(patched);
+    }
 
     // =======================================================================
     // Internal data carrier
@@ -547,11 +860,12 @@ public static class PptxGenerator
 
     private class OutputSlide
     {
-        public SlidePart       Part         { get; }
-        public SlideRole       Role         { get; }
-        public WordEntry?      Entry        { get; init; }
-        public List<WordEntry> IndexEntries { get; init; } = [];
-        public int             IndexPage    { get; init; } = 1;
+        public SlidePart       Part            { get; }
+        public SlideRole       Role            { get; }
+        public WordEntry?      Entry           { get; init; }
+        public List<WordEntry> IndexEntries    { get; init; } = [];
+        public int             IndexPage       { get; init; } = 1;
+        public int             GlobalRowOffset { get; init; } = 0;
 
         public OutputSlide(SlidePart part, SlideRole role)
         {

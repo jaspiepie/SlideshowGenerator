@@ -6,7 +6,7 @@ public class TemplateConfig
     public string             TemplatePath      { get; set; } = "";
     public List<SlideDefinition> Slides         { get; set; } = [];
     public bool               HyperlinkIndex    { get; set; } = true;
-    public string             IndexLineFormat   { get; set; } = "{word}";
+    public string             IndexLineFormat   { get; set; } = "{word} {type} {english}";
     public int                WordsPerIndexPage { get; set; } = 20;
     public DateTime           CreatedAt         { get; set; } = DateTime.Now;
 
