@@ -57,13 +57,10 @@ public static class PptxGenerator
 
         File.Copy(config.TemplatePath, outputPath, overwrite: true);
 
-        // Populated during naming; used by PostRenameSlides after the SDK closes the file.
-        var nameMap = new Dictionary<string, string>(); // auto-name (slide4.xml) → desired (Slide_der_Hund.xml)
-
         using var doc    = PresentationDocument.Open(outputPath, isEditable: true);
         var presPart     = doc.PresentationPart!;
         var presentation = presPart.Presentation;
-        var slideIdList  = presentation.SlideIdList!;
+        var slideIdList  = presentation!.SlideIdList!;
 
         var templateIds   = slideIdList.Elements<SlideId>().ToList();
         var templateParts = templateIds
@@ -144,9 +141,6 @@ public static class PptxGenerator
                 _                => $"Slide_{i + 1:000}",
             };
             SetSlideName(item.Part, name);
-            // Track the SDK's auto-generated filename so PostRenameSlides can update it.
-            string autoName = item.Part.Uri.OriginalString.Split('/').Last(); // e.g. "slide4.xml"
-            nameMap[autoName] = name + ".xml";                                // → "Slide_der_Hund.xml"
         }
 
         // ── PASS 2A: Build index tables ───────────────────────────────────
@@ -189,44 +183,17 @@ public static class PptxGenerator
         }
 
         presentation.Save();
-
-        doc.Save();
-
-        // Explicitly dispose (close the file handle) before manipulating the ZIP.
-        // The using var will call Dispose() again at method end — that is a safe no-op.
-        doc.Dispose();
-        PostRenameSlides(outputPath, nameMap);
     }
 
-    // -----------------------------------------------------------------------
-    // Create an internal hyperlink relationship to another slide.
-    //
-    // The target must be the slide's ACTUAL filename within the package
-    // (e.g. "slide4.xml") so PowerPoint can confirm the relationship is
-    // internal.  Uri.Segments throws on relative URIs, so we split
-    // OriginalString to extract the filename safely.
-    //
-    // isExternal: false  →  TargetMode="Internal" in the .rels file.
-    // action="ppaction://hlinksldjump" on the hlinkClick element tells
-    // PowerPoint to perform a slide jump rather than a shell-open.
-    // -----------------------------------------------------------------------
-    private static string AddSlideHyperlink(OpenXmlPart source, string target)
+    private static string AddSlideJumpRelationship(SlidePart source, SlidePart target)
     {
-        var rel = source.AddHyperlinkRelationship(
-            new Uri(target, UriKind.Relative),
-            isExternal: false);
+        foreach (var rel in source.Parts)
+        {
+            if (ReferenceEquals(rel.OpenXmlPart, target))
+                return rel.RelationshipId;
+        }
 
-        return rel.Id;
-    }
-
-    // Overload that accepts a SlidePart — uses the slide's actual package filename
-    // (e.g. "slide4.xml") so the TargetMode="Internal" relationship can be
-    // resolved to a real part in the package.
-    // Uri.Segments throws on relative URIs, so OriginalString.Split is used.
-    private static string AddSlideHyperlink(OpenXmlPart source, SlidePart target)
-    {
-        string filename = target.Uri.OriginalString.Split('/').Last();
-        return AddSlideHyperlink(source, filename);
+        return source.CreateRelationshipToPart(target);
     }
 
     // =======================================================================
@@ -407,11 +374,7 @@ public static class PptxGenerator
 
             if (isWord && hyperlink && wordPartMap.TryGetValue(entry, out SlidePart? targetPart))
             {
-                // Use the actual package filename so TargetMode="Internal" resolves
-                // to a real part in the package.
-                string filename = targetPart.Uri.OriginalString.Split('/').Last();
-
-                string relId = AddSlideHyperlink(indexPart, filename);
+                string relId = AddSlideJumpRelationship(indexPart, targetPart);
                 para = MakeHyperlinkParagraph(value, relId, fontSize: 11);
             }
             else
@@ -538,14 +501,14 @@ public static class PptxGenerator
         var nextShape = FindShapeByName(wordPart, ShapeNext);
         if (nextShape != null && nextPart != null)
         {
-            string relId = AddSlideHyperlink(wordPart, nextPart);
+            string relId = AddSlideJumpRelationship(wordPart, nextPart);
             SetShapeHlinkClick(nextShape, relId);
         }
 
         var idxShape = FindShapeByName(wordPart, ShapeIndex);
         if (idxShape != null && indexPart != null)
         {
-            string relId = AddSlideHyperlink(wordPart, indexPart);
+            string relId = AddSlideJumpRelationship(wordPart, indexPart);
             SetShapeHlinkClick(idxShape, relId);
         }
 
@@ -557,26 +520,16 @@ public static class PptxGenerator
         var cNvPr = shape.NonVisualShapeProperties?.NonVisualDrawingProperties;
         if (cNvPr == null) return;
 
-        // Remove any shape-level hyperlink the template may have left behind.
         cNvPr.Elements<A.HyperlinkOnClick>().ToList().ForEach(h => h.Remove());
 
-        // Also strip hyperlinks from every text run inside the shape.
-        // If the template set the hyperlink on the text rather than the shape,
-        // the cloned slide keeps that r:id reference even though the relationship
-        // is not copied — PowerPoint then falls back to opening "#Slide N"
-        // via Windows Shell, producing the "Windows cannot find #Slide N" error.
         foreach (var rPr in shape.Descendants<A.RunProperties>())
             rPr.Elements<A.HyperlinkOnClick>().ToList().ForEach(h => h.Remove());
 
-        // Place hlinkClick at index 0: per CT_NonVisualDrawingProps schema the
-        // sequence is hlinkClick → hlinkHover → extLst.  Append would put it
-        // after extLst (a schema violation PowerPoint silently ignores the link).
-        cNvPr.InsertAt(new A.HyperlinkOnClick { Id = relId, Action = SlideJumpAction }, 0);
-
-        // Also wire every text run so a click anywhere on the shape triggers
-        // the link — this is the same mechanism confirmed working for index links.
-        foreach (var rPr in shape.Descendants<A.RunProperties>())
-            rPr.InsertAt(new A.HyperlinkOnClick { Id = relId, Action = SlideJumpAction }, 0);
+        cNvPr.InsertAt(new A.HyperlinkOnClick
+        {
+            Id = relId,
+            Action = SlideJumpAction
+        }, 0);
     }
 
     // =======================================================================
@@ -755,103 +708,6 @@ public static class PptxGenerator
             runs[0].Text = new A.Text(combined);
             for (int i = 1; i < runs.Count; i++) runs[i].Remove();
         }
-    }
-
-    // =======================================================================
-    // Post-process: rename slide files inside the .pptx ZIP so that the
-    // package filenames match the display names set by SetSlideName.
-    //
-    // The Open XML SDK auto-generates URIs like "slide4.xml".  After the SDK
-    // closes the file, we rename every slide part to its desired name
-    // (e.g. "Slide_der_Hund.xml") and patch every .rels / content-types
-    // reference, so that internal hyperlinks resolve to real package parts.
-    // =======================================================================
-
-    private static void PostRenameSlides(
-        string outputPath,
-        IReadOnlyDictionary<string, string> nameMap)
-    {
-        if (nameMap.Count == 0) return;
-
-        using var zip = ZipFile.Open(outputPath, ZipArchiveMode.Update);
-
-        // 1. Rename ppt/slides/slide{N}.xml → ppt/slides/Slide_{word}.xml
-        foreach (var (oldName, newName) in nameMap)
-            RenameZipEntry(zip, $"ppt/slides/{oldName}", $"ppt/slides/{newName}");
-
-        // 2. Rename ppt/slides/_rels/slide{N}.xml.rels → ppt/slides/_rels/Slide_{word}.xml.rels
-        foreach (var (oldName, newName) in nameMap)
-            RenameZipEntry(zip, $"ppt/slides/_rels/{oldName}.rels",
-                                $"ppt/slides/_rels/{newName}.rels");
-
-        // 3. Update slide targets in ppt/_rels/presentation.xml.rels
-        PatchZipEntry(zip, "ppt/_rels/presentation.xml.rels",
-            c => ReplaceQuotedRefs(c, nameMap, "slides/"));
-
-        // 4. Update hyperlink targets inside each slide's .rels file.
-        //    Files were already renamed in step 2, so iterate over new names.
-        foreach (var newName in nameMap.Values)
-            PatchZipEntry(zip, $"ppt/slides/_rels/{newName}.rels",
-                c => ReplaceQuotedRefs(c, nameMap, ""));
-
-        // 5. Update Override PartNames in [Content_Types].xml
-        PatchZipEntry(zip, "[Content_Types].xml",
-            c => ReplaceQuotedRefs(c, nameMap, "/ppt/slides/"));
-    }
-
-    // Replace quoted occurrences of each old filename with the new filename.
-    // Using surrounding double-quotes prevents "slide1.xml" from matching inside
-    // "slide10.xml" or "slideLayout1.xml".
-    private static string ReplaceQuotedRefs(
-        string content,
-        IReadOnlyDictionary<string, string> nameMap,
-        string prefix)
-    {
-        foreach (var (oldName, newName) in nameMap)
-            content = content.Replace(
-                $"\"{prefix}{oldName}\"",
-                $"\"{prefix}{newName}\"");
-        return content;
-    }
-
-    private static void RenameZipEntry(ZipArchive zip, string oldPath, string newPath)
-    {
-        var oldEntry = zip.GetEntry(oldPath);
-        if (oldEntry == null) return;
-
-        // Read all bytes first — the stream must be closed before deleting the entry.
-        byte[] data;
-        using (var src = oldEntry.Open())
-        using (var ms  = new MemoryStream())
-        {
-            src.CopyTo(ms);
-            data = ms.ToArray();
-        }
-
-        oldEntry.Delete();
-
-        var newEntry = zip.CreateEntry(newPath, CompressionLevel.Optimal);
-        using var dst = newEntry.Open();
-        dst.Write(data, 0, data.Length);
-    }
-
-    private static void PatchZipEntry(ZipArchive zip, string path, Func<string, string> patch)
-    {
-        var entry = zip.GetEntry(path);
-        if (entry == null) return;
-
-        string content;
-        using (var stream = entry.Open())
-        using (var reader = new StreamReader(stream))
-            content = reader.ReadToEnd();
-
-        string patched = patch(content);
-        if (patched == content) return; // nothing changed
-
-        entry.Delete();
-        var newEntry = zip.CreateEntry(path, CompressionLevel.Optimal);
-        using var writer = new StreamWriter(newEntry.Open());
-        writer.Write(patched);
     }
 
     // =======================================================================
