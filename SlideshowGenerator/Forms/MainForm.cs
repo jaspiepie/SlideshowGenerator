@@ -154,8 +154,6 @@ public class MainForm : Form
             Location  = new Point(bottom.Width - 188, 12),
             Anchor    = AnchorStyles.Right | AnchorStyles.Top,
             Enabled   = false,
-            BackColor = Color.FromArgb(0, 120, 215),
-            ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat,
             Font      = new Font("Segoe UI", 9.5f, FontStyle.Bold),
         };
