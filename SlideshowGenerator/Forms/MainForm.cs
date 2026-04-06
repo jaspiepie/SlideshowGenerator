@@ -129,7 +129,7 @@ public class MainForm : Form
         {
             Text     = "❓ Help",
             Size     = new Size(80, 30),
-            Location = new Point(bottom.Width - 360, 12),
+            Location = new Point(bottom.Width - 460, 12),
             Anchor   = AnchorStyles.Right | AnchorStyles.Top,
             FlatStyle = FlatStyle.Flat,
         };
@@ -140,7 +140,7 @@ public class MainForm : Form
         {
             Text     = "Save Excel Template",
             Size     = new Size(150, 30),
-            Location = new Point(bottom.Width - 270, 12),
+            Location = new Point(bottom.Width - 370, 12),
             Anchor   = AnchorStyles.Right | AnchorStyles.Top,
             FlatStyle = FlatStyle.Flat,
         };
@@ -153,13 +153,8 @@ public class MainForm : Form
             Size      = new Size(172, 30),
             Location  = new Point(bottom.Width - 188, 12),
             Anchor    = AnchorStyles.Right | AnchorStyles.Top,
-            Enabled   = false,
-            BackColor = Color.FromArgb(0, 120, 215),
-            ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat,
-            Font      = new Font("Segoe UI", 9.5f, FontStyle.Bold),
         };
-        btnGenerate.FlatAppearance.BorderSize = 0;
         btnGenerate.Click += Generate;
 
         bottom.Controls.AddRange([progressBar, lblStatus, btnHelp, btnExcelTpl, btnGenerate]);
