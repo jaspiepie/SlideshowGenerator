@@ -4,7 +4,6 @@ using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
 using LanguageCourseSlides.Models;
 using System.IO.Compression;
-using System.IO.Packaging;
 using System.Text;
 using System.Text.RegularExpressions;
 using A = DocumentFormat.OpenXml.Drawing;
@@ -142,6 +141,7 @@ public static class PptxGenerator
                 _                => $"Slide_{i + 1:000}",
             };
             SetSlideName(item.Part, name);
+            item.Part.Slide.Save();
         }
 
         // ── PASS 2A: Build index tables ───────────────────────────────────
@@ -188,19 +188,16 @@ public static class PptxGenerator
 
     private static string AddSlideJumpRelationship(SlidePart source, SlidePart target)
     {
+        var targetUri = BuildSlideJumpUri(target);
+
         foreach (var rel in source.HyperlinkRelationships)
         {
             if (rel.IsExternal) continue;
-
-            // Hyperlinks are stored as URIs, so resolve them against the
-            // current slide before comparing them to the actual target part.
-            var resolvedTarget = PackUriHelper.ResolvePartUri(source.Uri, rel.Uri);
-            if (resolvedTarget == target.Uri)
+            if (rel.Uri == targetUri)
                 return rel.Id;
         }
 
-        var relativeTarget = PackUriHelper.GetRelativeUri(source.Uri, target.Uri);
-        return source.AddHyperlinkRelationship(relativeTarget, isExternal: false).Id;
+        return source.AddHyperlinkRelationship(targetUri, isExternal: false).Id;
     }
 
     // =======================================================================
@@ -674,6 +671,16 @@ public static class PptxGenerator
     {
         var cSld = slidePart.Slide.CommonSlideData;
         if (cSld != null) cSld.Name = name;
+    }
+
+    private static Uri BuildSlideJumpUri(SlidePart slidePart)
+    {
+        var slideName = slidePart.Slide.CommonSlideData?.Name?.Value;
+        if (!string.IsNullOrWhiteSpace(slideName))
+            return new Uri($"#{slideName}", UriKind.Relative);
+
+        // Fallback for unexpected unnamed slides.
+        return slidePart.Uri;
     }
 
     private static string SanitizeName(string word)
